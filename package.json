@@ -2,26 +2,38 @@
   "name": "workflowy-mcp",
   "version": "0.1.0",
   "description": "A remote self-hosted MCP server for Workflowy.",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start"
+    "dev": "NEXT_TELEMETRY_DISABLED=1 next dev",
+    "build": "NEXT_TELEMETRY_DISABLED=1 next build",
+    "start": "NEXT_TELEMETRY_DISABLED=1 next start",
+    "test": "tsx --test tests/**/*.test.ts"
   },
   "keywords": [],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "1.32.2",
     "@neondatabase/serverless": "^0.10.0",
-    "mcp-handler": "^1.0.4",
-    "next": "^14.2.0",
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "zod": "^3.24.2"
+    "next": "16.4.3",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "zod": "^4.6.7"
+  },
+  "overrides": {
+    "ajv": "8.20.0",
+    "fast-uri": "3.1.9",
+    "nanoid": "3.3.20",
+    "postcss": "8.5.31",
+    "source-map-js": "1.2.2"
   },
   "devDependencies": {
     "@types/node": "^22.13.10",
-    "@types/react": "^18.2.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "tsx": "^4.20.6",
     "typescript": "^5.4.0"
   }
 }

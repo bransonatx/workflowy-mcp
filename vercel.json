@@ -1,3 +1,5 @@
 {
-  "framework": "nextjs"
+  "framework": "nextjs",
+  "installCommand": "npm ci",
+  "buildCommand": "NEXT_TELEMETRY_DISABLED=1 next build"
 }

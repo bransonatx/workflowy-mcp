@@ -1,13 +1,16 @@
-import { createHash } from "crypto";
 import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
 import { NextRequest, NextResponse } from "next/server";
+import { accountKeyFromApiKey } from "../../../lib/security";
 import {
   getWorkflowyApiKey,
   isAdminAuthenticated,
+  publicErrorMessage,
+  rejectCrossSiteMutation,
   unauthorizedJson,
 } from "../_auth";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 type SqlClient = NeonQueryFunction<false, false>;
 
@@ -46,10 +49,6 @@ async function getDb(): Promise<SqlClient> {
   })();
 
   return dbPromise;
-}
-
-function accountKeyFromApiKey(apiKey: string): string {
-  return createHash("sha256").update(apiKey).digest("hex");
 }
 
 function getAccountKey(): string {
@@ -94,7 +93,7 @@ export async function GET(request: NextRequest): Promise<Response> {
     return NextResponse.json(
       {
         error: {
-          message: error instanceof Error ? error.message : String(error),
+          message: publicErrorMessage(error),
         },
       },
       { status: 503 },
@@ -103,6 +102,11 @@ export async function GET(request: NextRequest): Promise<Response> {
 }
 
 export async function DELETE(request: NextRequest): Promise<Response> {
+  const blocked = rejectCrossSiteMutation(request);
+  if (blocked) {
+    return blocked;
+  }
+
   if (!isAdminAuthenticated(request)) {
     return unauthorizedJson();
   }
@@ -124,7 +128,7 @@ export async function DELETE(request: NextRequest): Promise<Response> {
     return NextResponse.json(
       {
         error: {
-          message: error instanceof Error ? error.message : String(error),
+          message: publicErrorMessage(error),
         },
       },
       { status: 503 },

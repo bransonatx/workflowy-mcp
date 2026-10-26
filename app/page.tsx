@@ -1162,7 +1162,7 @@ export default function Home() {
 
           <a
             className={styles.dashboardGithubLink}
-            href="https://github.com/rodolfo-terriquez/workflowy-mcp"
+            href="https://github.com/bransonatx/workflowy-mcp"
             target="_blank"
             rel="noopener noreferrer"
             title="View on GitHub"

@@ -1,6 +1,8 @@
-# Workflowy MCP
+# Workflowy MCP (Branson's fork)
 
-A remote, self-hosted MCP server for Workflowy. Deploy it to Vercel, store your Workflowy credentials server-side, and connect from MCP clients that support Streamable HTTP.
+This is Branson's personal fork of [rodolfo-terriquez/workflowy-mcp](https://github.com/rodolfo-terriquez/workflowy-mcp). It is a remote, self-hosted MCP server for his Workflowy outline. The short setup list for this fork is in [docs/SETUP-FOR-BRANSON.md](docs/SETUP-FOR-BRANSON.md).
+
+Deploy it to Vercel, store the Workflowy credential on the server, and connect from MCP clients that support Streamable HTTP.
 
 This is the hosted companion to [workflowy-local-mcp](https://github.com/rodolfo-terriquez/workflowy-local-mcp). Use the local app when you want everything to stay on your machine. Use this project when you want a remote MCP endpoint that works from places where a local MCP process is not available.
 
@@ -57,11 +59,9 @@ Recommended MCP auth header:
 Authorization: Bearer YOUR_MCP_ACCESS_SECRET
 ```
 
-The server verifies that bearer token against `MCP_ACCESS_SECRET`, then uses `WORKFLOWY_API_KEY` from the deployment environment. That means users do not need to paste their Workflowy API key into both the MCP client and the web console.
+The server verifies that bearer token against `MCP_ACCESS_SECRET`, then uses `WORKFLOWY_API_KEY` from the deployment environment. The MCP client does not send the Workflowy API key. A bearer value shaped like `MCP_ACCESS_SECRET:WORKFLOWY_API_KEY` is rejected.
 
-The web console login sets a signed, HTTP-only cookie that lasts 12 hours. The Workflowy API key is not stored in Neon or browser local storage. Bookmarks, cache rows, custom MCP settings, and server logs are stored in Neon under a SHA-256 hash of the Workflowy API key.
-
-Legacy per-request key mode still works as `Authorization: Bearer MCP_ACCESS_SECRET:WORKFLOWY_API_KEY`, but new deployments should use the server-side `WORKFLOWY_API_KEY` flow above.
+The web console login sets a signed, HTTP-only cookie that lasts 12 hours. The Workflowy API key is not stored in Neon or browser local storage. Bookmarks, a searchable copy of outline text, custom MCP settings, and server logs are stored in Neon under a SHA-256 hash of the Workflowy API key. `ADMIN_SECRET` and `MCP_ACCESS_SECRET` must each be at least 32 characters.
 
 ## Prerequisites
 
@@ -113,7 +113,7 @@ Optional browser origin restriction:
 ALLOWED_ORIGINS=https://claude.ai
 ```
 
-If `ALLOWED_ORIGINS` is unset, non-browser requests and browser requests are allowed. If it is set, browser-originated requests must match one of the comma-separated origins.
+If `ALLOWED_ORIGINS` is unset, browser and non-browser requests are allowed and the CORS header is `*`. If it is set, browser-originated requests must match one of the comma-separated origins. The server does not copy an arbitrary `Origin` header back to the client.
 
 6. Deploy the project.
 
@@ -217,8 +217,8 @@ Run it locally:
 ```sh
 docker run --rm -p 3000:3000 \
   -e DATABASE_URL="postgres://..." \
-  -e ADMIN_SECRET="your-admin-secret" \
-  -e MCP_ACCESS_SECRET="your-mcp-access-secret" \
+  -e ADMIN_SECRET="replace-with-32-plus-random-characters" \
+  -e MCP_ACCESS_SECRET="replace-with-a-different-32-plus-random-secret" \
   -e WORKFLOWY_API_KEY="your-workflowy-api-key" \
   workflowy-mcp
 ```
@@ -277,8 +277,8 @@ Create `.env.local`:
 
 ```text
 DATABASE_URL=postgres://...
-ADMIN_SECRET=dev-admin-secret
-MCP_ACCESS_SECRET=dev-mcp-secret
+ADMIN_SECRET=replace-with-32-plus-random-characters
+MCP_ACCESS_SECRET=replace-with-a-different-32-plus-random-secret
 WORKFLOWY_API_KEY=your-workflowy-api-key
 ```
 
@@ -300,10 +300,10 @@ Local MCP endpoint:
 http://localhost:3000/api/mcp
 ```
 
-For local client testing, use:
+For local client testing, send the same `MCP_ACCESS_SECRET` value:
 
 ```text
-Authorization: Bearer dev-mcp-secret
+Authorization: Bearer YOUR_MCP_ACCESS_SECRET
 ```
 
 ## Operational Notes

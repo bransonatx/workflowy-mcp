@@ -2,7 +2,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { buildAdminStatus, isAdminAuthenticated } from "../_auth";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 export async function GET(request: NextRequest): Promise<NextResponse> {
-  return NextResponse.json(buildAdminStatus(request, isAdminAuthenticated(request)));
+  return NextResponse.json(buildAdminStatus(request, isAdminAuthenticated(request)), {
+    headers: { "Cache-Control": "no-store" },
+  });
 }

@@ -1,6 +1,12 @@
-import { createHmac, timingSafeEqual } from "crypto";
+import { createHmac } from "crypto";
 import { NextRequest, NextResponse } from "next/server";
 import packageJson from "../../../package.json";
+import {
+  MIN_SECRET_LENGTH,
+  adminMutationAllowed,
+  redactSensitiveText,
+  timingSafeStringEqual,
+} from "../../lib/security";
 
 export const ADMIN_COOKIE_NAME = "workflowy_mcp_admin";
 
@@ -35,15 +41,6 @@ export function getMcpAccessSecret(): string {
 
 export function getWorkflowyApiKey(): string {
   return getRequiredEnv("WORKFLOWY_API_KEY");
-}
-
-export function timingSafeStringEqual(a: string, b: string): boolean {
-  const aBuffer = Buffer.from(a);
-  const bBuffer = Buffer.from(b);
-  if (aBuffer.length !== bBuffer.length) {
-    return false;
-  }
-  return timingSafeEqual(aBuffer, bBuffer);
 }
 
 export function adminSecretMatches(secret: string): boolean {
@@ -135,5 +132,36 @@ export function buildAdminStatus(request: NextRequest, authenticated: boolean): 
 }
 
 export function unauthorizedJson(message = "Admin session required"): NextResponse {
-  return NextResponse.json({ error: message }, { status: 401 });
+  return NextResponse.json(
+    { error: message },
+    { status: 401, headers: { "Cache-Control": "no-store" } },
+  );
+}
+
+export function adminSecretConfigurationError(): string | null {
+  const adminSecret = getAdminSecret();
+  if (adminSecret.length < MIN_SECRET_LENGTH) {
+    return "ADMIN_SECRET must be a random value at least 32 characters long.";
+  }
+  return null;
+}
+
+export function rejectCrossSiteMutation(request: NextRequest): NextResponse | null {
+  if (adminMutationAllowed(request)) {
+    return null;
+  }
+  return NextResponse.json(
+    { error: "Cross-site request blocked." },
+    { status: 403, headers: { "Cache-Control": "no-store" } },
+  );
+}
+
+export function publicErrorMessage(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  return redactSensitiveText(raw, [
+    getAdminSecret(),
+    getMcpAccessSecret(),
+    getWorkflowyApiKey(),
+    process.env.DATABASE_URL ?? "",
+  ]);
 }

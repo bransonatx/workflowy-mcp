@@ -1,7 +1,6 @@
-import { createHash } from "crypto";
-import { createMcpHandler, withMcpAuth } from "mcp-handler";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import type { RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, type RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import {
   InitializeRequestSchema,
   ListToolsRequestSchema,
@@ -17,12 +16,33 @@ import {
   type McpToolName,
 } from "../../lib/mcp-defaults";
 import {
+  MAX_MCP_BODY_BYTES,
+  MAX_TOOL_INPUT_ELEMENTS,
+  accountKeyFromApiKey,
+  clearRateLimit,
+  clientRateLimitKey,
+  decideMcpAuth,
+  isBrowserOriginAllowed,
+  rateLimitAllows,
+  recordRateLimitFailure,
+  redactSensitiveText,
+  redactSensitiveValue,
+  sameOriginRedirectTarget,
+} from "../../lib/security";
+import packageJson from "../../../package.json";
+import {
   getMcpAccessSecret,
   getWorkflowyApiKey,
-  timingSafeStringEqual,
+  publicErrorMessage,
 } from "../admin/_auth";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const maxDuration = 60;
+
+const MCP_AUTH_WINDOW_MS = 15 * 60 * 1000;
+const MCP_AUTH_FAILURE_LIMIT = 30;
+const MAX_WORKFLOWY_RESPONSE_BYTES = 32 * 1024 * 1024;
 
 const WORKFLOWY_API_BASE = "https://workflowy.com";
 const LLM_DOC_API_BASE = "https://beta.workflowy.com";
@@ -79,7 +99,6 @@ interface McpLogInput {
 }
 
 let dbPromise: Promise<SqlClient> | undefined;
-const registeredTools: Partial<Record<McpToolName, RegisteredTool>> = {};
 
 async function getDb(): Promise<SqlClient> {
   if (dbPromise) {
@@ -196,8 +215,17 @@ function parseJsonContent(value: ToolResponse): unknown {
   }
 }
 
+function configuredSecrets(): string[] {
+  return [
+    getMcpAccessSecret(),
+    getWorkflowyApiKey(),
+    process.env.ADMIN_SECRET ?? "",
+    process.env.DATABASE_URL ?? "",
+  ];
+}
+
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return publicErrorMessage(error);
 }
 
 function getApiKey(extra: { authInfo?: AuthInfo }): string {
@@ -207,17 +235,14 @@ function getApiKey(extra: { authInfo?: AuthInfo }): string {
   return extra.authInfo.token;
 }
 
-function accountKeyFromApiKey(apiKey: string): string {
-  return createHash("sha256").update(apiKey).digest("hex");
-}
-
 function safeLogValue(value: unknown, depth = 0): unknown {
   if (depth > 3) {
     return "[truncated]";
   }
 
   if (typeof value === "string") {
-    return value.length > 240 ? `${value.slice(0, 240)}...` : value;
+    const redacted = redactSensitiveText(value, configuredSecrets());
+    return redacted.length > 240 ? `${redacted.slice(0, 240)}...` : redacted;
   }
 
   if (
@@ -384,17 +409,23 @@ async function getSettingsForApiKey(apiKey: string): Promise<{
   return { sql, accountKey, settings };
 }
 
-function updateRegisteredToolDescriptions(settings: McpSettings): void {
-  for (const [name, tool] of Object.entries(registeredTools) as Array<
+function updateRegisteredToolDescriptions(
+  tools: Partial<Record<McpToolName, RegisteredTool>>,
+  settings: McpSettings,
+): void {
+  for (const [name, tool] of Object.entries(tools) as Array<
     [McpToolName, RegisteredTool | undefined]
   >) {
     tool?.update({ description: toolDescription(settings, name) });
   }
 }
 
-async function refreshRegisteredToolDescriptions(apiKey: string): Promise<void> {
+async function refreshRegisteredToolDescriptions(
+  tools: Partial<Record<McpToolName, RegisteredTool>>,
+  apiKey: string,
+): Promise<void> {
   const { settings } = await getSettingsForApiKey(apiKey);
-  updateRegisteredToolDescriptions(settings);
+  updateRegisteredToolDescriptions(tools, settings);
 }
 
 function updateServerInstructions(
@@ -417,12 +448,67 @@ function clampDepth(depth: number | undefined): number {
   return Math.min(Math.max(Math.trunc(depth ?? 3), 1), 10);
 }
 
+async function readLimitedText(response: Response, maxBytes: number): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    return "";
+  }
+
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw new Error("Workflowy response exceeded the 32MB size limit");
+    }
+    chunks.push(value);
+  }
+
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(body);
+}
+
+async function workflowyFetch(url: string, init: RequestInit): Promise<Response> {
+  const target = new URL(url);
+  const first = await fetch(target, {
+    ...init,
+    cache: "no-store",
+    redirect: "manual",
+  });
+
+  if (first.status < 300 || first.status >= 400) {
+    return first;
+  }
+
+  const location = first.headers.get("location");
+  const nextUrl = location ? sameOriginRedirectTarget(target.toString(), location) : null;
+  if (!nextUrl) {
+    throw new Error("Blocked a Workflowy redirect to another site");
+  }
+
+  return fetch(nextUrl, {
+    ...init,
+    cache: "no-store",
+    redirect: "error",
+  });
+}
+
 async function workflowyJsonRequest(
   apiKey: string,
   url: string,
   init: RequestInit,
 ): Promise<{ ok: boolean; status: number; data: unknown }> {
-  const res = await fetch(url, {
+  const res = await workflowyFetch(url, {
     ...init,
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -431,15 +517,19 @@ async function workflowyJsonRequest(
     },
   });
 
-  const text = await res.text();
+  const text = await readLimitedText(res, MAX_WORKFLOWY_RESPONSE_BYTES);
   let data: unknown;
   try {
     data = text ? JSON.parse(text) : null;
   } catch {
-    data = { raw: text };
+    data = { raw: redactSensitiveText(text, configuredSecrets()) };
   }
 
-  return { ok: res.ok, status: res.status, data };
+  return {
+    ok: res.ok,
+    status: res.status,
+    data: redactSensitiveValue(data, configuredSecrets()),
+  };
 }
 
 function toIsoFromWorkflowyTimestamp(value: number | null | undefined): string | null {
@@ -1529,9 +1619,9 @@ async function buildServerInstructions(apiKey: string): Promise<string> {
   return instructions;
 }
 
-const handler = createMcpHandler(
-  async (server) => {
-    registeredTools.list_bookmarks = server.tool(
+async function registerWorkflowyTools(server: McpServer): Promise<void> {
+  const registeredTools: Partial<Record<McpToolName, RegisteredTool>> = {};
+  registeredTools.list_bookmarks = server.tool(
       "list_bookmarks",
       DEFAULT_TOOL_DESCRIPTIONS.list_bookmarks,
       {},
@@ -1937,7 +2027,7 @@ const handler = createMcpHandler(
         const apiKey = getApiKey(extra);
         const accountKey = accountKeyFromApiKey(apiKey);
         const startedAt = Date.now();
-        await refreshRegisteredToolDescriptions(apiKey).catch(() => undefined);
+        await refreshRegisteredToolDescriptions(registeredTools, apiKey).catch(() => undefined);
         const result = (await originalListToolsHandler(request, extra)) as {
           tools: unknown[];
         };
@@ -1957,131 +2047,162 @@ const handler = createMcpHandler(
 
     const envApiKey = getWorkflowyApiKey();
     if (envApiKey) {
-      await refreshRegisteredToolDescriptions(envApiKey).catch(() => undefined);
+      await refreshRegisteredToolDescriptions(registeredTools, envApiKey).catch(() => undefined);
       await buildServerInstructions(envApiKey)
         .then((instructions) => updateServerInstructions(protocolServer, instructions))
         .catch(() => undefined);
     }
-  },
-  { instructions: DEFAULT_SERVER_INSTRUCTIONS },
-  { basePath: "/api" },
-);
+}
 
-const verifyToken = async (
-  _req: Request,
-  bearerToken?: string,
-): Promise<AuthInfo | undefined> => {
-  if (!bearerToken) {
-    return undefined;
-  }
-
-  const accessSecret = getMcpAccessSecret();
-  if (!accessSecret) {
-    return undefined;
-  }
-
-  const workflowyApiKeyFromEnv = getWorkflowyApiKey();
-  if (timingSafeStringEqual(bearerToken, accessSecret)) {
-    if (!workflowyApiKeyFromEnv) {
-      return undefined;
-    }
-
-    return {
-      token: workflowyApiKeyFromEnv,
-      scopes: ["workflowy"],
-      clientId: accountKeyFromApiKey(workflowyApiKeyFromEnv).slice(0, 12),
-    };
-  }
-
-  const separatorIndex = bearerToken.indexOf(":");
-  if (separatorIndex <= 0) {
-    return undefined;
-  }
-
-  const providedSecret = bearerToken.slice(0, separatorIndex);
-  if (!timingSafeStringEqual(providedSecret, accessSecret)) {
-    return undefined;
-  }
-
-  const workflowyApiKey = bearerToken.slice(separatorIndex + 1).trim();
-  if (!workflowyApiKey) {
-    return undefined;
-  }
-
-  return {
-    token: workflowyApiKey,
-    scopes: ["workflowy"],
-    clientId: accountKeyFromApiKey(workflowyApiKey).slice(0, 12),
-  };
-};
-
-function originIsAllowed(request: Request): boolean {
-  const origin = request.headers.get("origin");
-  const allowedOrigins = process.env.ALLOWED_ORIGINS;
-  if (!origin || !allowedOrigins?.trim()) {
-    return true;
-  }
-
-  return allowedOrigins
-    .split(",")
-    .map((allowedOrigin) => allowedOrigin.trim())
-    .filter(Boolean)
-    .includes(origin);
+function readBearerToken(request: Request): string | undefined {
+  const header = request.headers.get("authorization")?.trim() ?? "";
+  const match = /^Bearer\s+(\S+)$/i.exec(header);
+  return match?.[1];
 }
 
 function corsHeaders(request: Request): HeadersInit {
   const origin = request.headers.get("origin");
-  const allowedOrigins = process.env.ALLOWED_ORIGINS;
-  const allowOrigin = allowedOrigins?.trim() ? origin ?? "null" : origin ?? "*";
-
-  return {
-    "Access-Control-Allow-Origin": allowOrigin,
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  const allowedOrigins = process.env.ALLOWED_ORIGINS?.trim();
+  const headers: Record<string, string> = {
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Allow-Headers":
       "authorization, content-type, accept, mcp-session-id, mcp-protocol-version, last-event-id",
-    "Access-Control-Expose-Headers":
-      "mcp-session-id, mcp-protocol-version, www-authenticate",
+    "Access-Control-Expose-Headers": "mcp-session-id, mcp-protocol-version",
     "Access-Control-Max-Age": "86400",
+    "Cache-Control": "no-store",
     Vary: "Origin",
   };
+
+  if (!allowedOrigins) {
+    headers["Access-Control-Allow-Origin"] = "*";
+  } else if (
+    origin &&
+    isBrowserOriginAllowed(origin, allowedOrigins)
+  ) {
+    headers["Access-Control-Allow-Origin"] = origin;
+  }
+
+  return headers;
 }
 
 function withCors(response: Response, request: Request): Response {
-  const headers = corsHeaders(request);
-  for (const [key, value] of Object.entries(headers)) {
-    response.headers.set(key, value);
+  const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(corsHeaders(request))) {
+    headers.set(key, value);
   }
-  return response;
-}
-
-const authHandler = withMcpAuth(handler, verifyToken, { required: true });
-const runAuthHandler = authHandler as (
-  request: Request,
-  context?: { params?: { transport?: string } },
-) => Response | Promise<Response>;
-
-async function route(
-  request: Request,
-  context: { params?: { transport?: string } },
-): Promise<Response> {
-  if (!originIsAllowed(request)) {
-    return new Response("Origin not allowed", { status: 403 });
-  }
-
-  return withCors(await runAuthHandler(request, context), request);
-}
-
-async function options(
-  request: Request,
-): Promise<Response> {
-  if (!originIsAllowed(request)) {
-    return new Response("Origin not allowed", { status: 403 });
-  }
-
-  return new Response(null, {
-    status: 204,
-    headers: corsHeaders(request),
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
   });
 }
 
-export { route as DELETE, route as GET, options as OPTIONS, route as POST };
+function originAllowed(request: Request): boolean {
+  return isBrowserOriginAllowed(
+    request.headers.get("origin"),
+    process.env.ALLOWED_ORIGINS,
+  );
+}
+
+export async function handleMcpRequest(request: Request): Promise<Response> {
+  if (!originAllowed(request)) {
+    return new Response("Origin not allowed", {
+      status: 403,
+      headers: { "Cache-Control": "no-store" },
+    });
+  }
+
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: corsHeaders(request) });
+  }
+
+  if (request.method !== "POST") {
+    return withCors(new Response("Method not allowed", { status: 405 }), request);
+  }
+
+  const declaredLength = Number(request.headers.get("content-length") ?? "0");
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_MCP_BODY_BYTES) {
+    return withCors(new Response("Request body too large", { status: 413 }), request);
+  }
+
+  const rateKey = clientRateLimitKey(request, "mcp");
+  if (!rateLimitAllows(rateKey, MCP_AUTH_FAILURE_LIMIT, MCP_AUTH_WINDOW_MS)) {
+    return withCors(new Response("Too many authentication attempts", { status: 429 }), request);
+  }
+
+  const decision = decideMcpAuth({
+    bearerToken: readBearerToken(request),
+    accessSecret: getMcpAccessSecret(),
+    workflowyApiKey: getWorkflowyApiKey(),
+  });
+
+  if (!decision.ok || !decision.workflowyApiKey || !decision.clientId) {
+    if (decision.status === 401) {
+      recordRateLimitFailure(rateKey, MCP_AUTH_WINDOW_MS);
+    }
+    const message = decision.status === 503
+      ? "MCP access is not configured"
+      : "Unauthorized";
+    return withCors(
+      new Response(JSON.stringify({ error: message }), {
+        status: decision.status,
+        headers: {
+          "Content-Type": "application/json",
+          "WWW-Authenticate": 'Bearer error="invalid_token"',
+        },
+      }),
+      request,
+    );
+  }
+
+  clearRateLimit(rateKey);
+
+  const server = new McpServer(
+    { name: "workflowy-mcp", version: packageJson.version },
+    {
+      instructions: DEFAULT_SERVER_INSTRUCTIONS,
+      maxToolInputElements: MAX_TOOL_INPUT_ELEMENTS,
+    },
+  );
+  const transport = new WebStandardStreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true,
+    maxRequestBodySize: MAX_MCP_BODY_BYTES,
+  });
+
+  try {
+    await registerWorkflowyTools(server);
+    await server.connect(transport);
+    const response = await transport.handleRequest(request, {
+      authInfo: {
+        token: decision.workflowyApiKey,
+        clientId: decision.clientId,
+        scopes: ["workflowy"],
+      },
+    });
+    return withCors(response, request);
+  } catch (error) {
+    return withCors(
+      new Response(JSON.stringify({ error: errorMessage(error) }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      }),
+      request,
+    );
+  } finally {
+    await Promise.allSettled([transport.close(), server.close()]);
+  }
+}
+
+async function route(
+  request: Request,
+  context: { params: Promise<{ transport: string }> | { transport: string } },
+): Promise<Response> {
+  const params = await context.params;
+  if (params.transport !== "mcp") {
+    return new Response("Not found", { status: 404, headers: { "Cache-Control": "no-store" } });
+  }
+  return handleMcpRequest(request);
+}
+
+export { route as DELETE, route as GET, route as OPTIONS, route as POST };
